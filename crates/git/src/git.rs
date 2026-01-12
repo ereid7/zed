@@ -33,6 +33,10 @@ actions!(
         ToggleStaged,
         /// Stage status entries between an anchor entry and the cursor.
         StageRange,
+        /// Unstage status entries between an anchor entry and the cursor.
+        UnstageRange,
+        /// Restore status entries between an anchor entry and the cursor.
+        RestoreRange,
         /// Stages the current hunk and moves to the next one.
         StageAndNext,
         /// Unstages the current hunk and moves to the next one.

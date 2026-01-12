@@ -900,9 +900,10 @@
       "alt-enter": "menu::SecondaryConfirm",
       "delete": ["git::RestoreFile", { "skip_prompt": false }],
       "backspace": ["git::RestoreFile", { "skip_prompt": false }],
-      "shift-delete": ["git::RestoreFile", { "skip_prompt": false }],
-      "ctrl-backspace": ["git::RestoreFile", { "skip_prompt": false }],
-      "ctrl-delete": ["git::RestoreFile", { "skip_prompt": false }],
+      "shift-backspace": "git::RestoreRange",
+      "shift-delete": "git::RestoreRange",
+      "ctrl-backspace": ["git::RestoreFile", { "skip_prompt": true }],
+      "ctrl-delete": ["git::RestoreFile", { "skip_prompt": true }],
     },
   },
   {

@@ -1025,6 +1025,7 @@
       "x": "git::ToggleStaged",
       "shift-x": "git::StageAll",
       "g x": "git::StageRange",
+      "g d": "git::RestoreRange",
       "shift-u": "git::UnstageAll",
     },
   },

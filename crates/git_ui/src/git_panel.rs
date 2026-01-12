@@ -31,8 +31,8 @@ use git::stash::GitStash;
 use git::status::StageStatus;
 use git::{Amend, Signoff, ToggleStaged, repository::RepoPath, status::FileStatus};
 use git::{
-    ExpandCommitEditor, GitHostingProviderRegistry, RestoreTrackedFiles, StageAll, StashAll,
-    StashApply, StashPop, TrashUntrackedFiles, UnstageAll,
+    ExpandCommitEditor, GitHostingProviderRegistry, RestoreRange, RestoreTrackedFiles, StageAll,
+    StashAll, StashApply, StashPop, TrashUntrackedFiles, UnstageAll, UnstageRange,
 };
 use gpui::{
     Action, AsyncApp, AsyncWindowContext, Bounds, ClickEvent, Corner, DismissEvent, Entity,
@@ -615,12 +615,20 @@ pub struct GitPanel {
     local_committer: Option<GitCommitter>,
     local_committer_task: Option<Task<()>>,
     bulk_staging: Option<BulkStaging>,
+    bulk_restore: Option<BulkRestore>,
     stash_entries: GitStash,
     _settings_subscription: Subscription,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct BulkStaging {
+    repo_id: RepositoryId,
+    anchor: RepoPath,
+    stage: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BulkRestore {
     repo_id: RepositoryId,
     anchor: RepoPath,
 }
@@ -684,6 +692,7 @@ impl GitPanel {
                 }
                 if sort_by_path != was_sort_by_path || tree_view != was_tree_view {
                     this.bulk_staging.take();
+                    this.bulk_restore.take();
                     this.update_visible_entries(window, cx);
                 }
                 was_sort_by_path = sort_by_path;
@@ -784,6 +793,7 @@ impl GitPanel {
                 modal_open: false,
                 entry_count: 0,
                 bulk_staging: None,
+                bulk_restore: None,
                 stash_entries: Default::default(),
                 _settings_subscription,
             };
@@ -1433,6 +1443,8 @@ impl GitPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.set_bulk_restore_anchor(entry.repo_path.clone(), cx);
+
         maybe!({
             let active_repo = self.active_repository.clone()?;
             let path = active_repo
@@ -1785,8 +1797,7 @@ impl GitPanel {
         let Some(active_repository) = self.active_repository.clone() else {
             return;
         };
-        let mut set_anchor: Option<RepoPath> = None;
-        let mut clear_anchor = None;
+        let mut set_anchor: Option<(RepoPath, bool)> = None;
 
         let (stage, repo_paths) = {
             let repo = active_repository.read(cx);
@@ -1795,15 +1806,11 @@ impl GitPanel {
                     let repo_paths = vec![status_entry.clone()];
                     let stage = match GitPanel::stage_status_for_entry(status_entry, &repo) {
                         StageStatus::Staged => {
-                            if let Some(op) = self.bulk_staging.clone()
-                                && op.anchor == status_entry.repo_path
-                            {
-                                clear_anchor = Some(op.anchor);
-                            }
+                            set_anchor = Some((status_entry.repo_path.clone(), false));
                             false
                         }
                         StageStatus::Unstaged | StageStatus::PartiallyStaged => {
-                            set_anchor = Some(status_entry.repo_path.clone());
+                            set_anchor = Some((status_entry.repo_path.clone(), true));
                             true
                         }
                     };
@@ -1813,15 +1820,11 @@ impl GitPanel {
                     let repo_paths = vec![status_entry.entry.clone()];
                     let stage = match GitPanel::stage_status_for_entry(&status_entry.entry, &repo) {
                         StageStatus::Staged => {
-                            if let Some(op) = self.bulk_staging.clone()
-                                && op.anchor == status_entry.entry.repo_path
-                            {
-                                clear_anchor = Some(op.anchor);
-                            }
+                            set_anchor = Some((status_entry.entry.repo_path.clone(), false));
                             false
                         }
                         StageStatus::Unstaged | StageStatus::PartiallyStaged => {
-                            set_anchor = Some(status_entry.entry.repo_path.clone());
+                            set_anchor = Some((status_entry.entry.repo_path.clone(), true));
                             true
                         }
                     };
@@ -1866,15 +1869,8 @@ impl GitPanel {
                 }
             }
         };
-        if let Some(anchor) = clear_anchor {
-            if let Some(op) = self.bulk_staging.clone()
-                && op.anchor == anchor
-            {
-                self.bulk_staging = None;
-            }
-        }
-        if let Some(anchor) = set_anchor {
-            self.set_bulk_staging_anchor(anchor, cx);
+        if let Some((anchor, stage_direction)) = set_anchor {
+            self.set_bulk_staging_anchor(anchor, stage_direction, cx);
         }
 
         self.change_file_stage(stage, repo_paths, cx);
@@ -2018,7 +2014,26 @@ impl GitPanel {
         let Some(index) = self.selected_entry else {
             return;
         };
-        self.stage_bulk(index, cx);
+        self.toggle_bulk(index, cx);
+    }
+
+    fn unstage_range(&mut self, _: &git::UnstageRange, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(index) = self.selected_entry else {
+            return;
+        };
+        self.toggle_bulk(index, cx);
+    }
+
+    fn restore_range(
+        &mut self,
+        _: &git::RestoreRange,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self.selected_entry else {
+            return;
+        };
+        self.restore_bulk(index, window, cx);
     }
 
     fn stage_selected(&mut self, _: &git::StageFile, _window: &mut Window, cx: &mut Context<Self>) {
@@ -3443,7 +3458,11 @@ impl GitPanel {
     fn update_visible_entries(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let path_style = self.project.read(cx).path_style(cx);
         let bulk_staging = self.bulk_staging.take();
+        let bulk_restore = self.bulk_restore.take();
         let last_staged_path_prev_index = bulk_staging
+            .as_ref()
+            .and_then(|op| self.entry_by_path(&op.anchor));
+        let last_restore_path_prev_index = bulk_restore
             .as_ref()
             .and_then(|op| self.entry_by_path(&op.anchor));
 
@@ -3660,6 +3679,16 @@ impl GitPanel {
                 .unwrap_or(false)
         {
             self.bulk_staging = bulk_staging;
+        }
+
+        let bulk_restore_anchor_new_index = bulk_restore
+            .as_ref()
+            .filter(|op| op.repo_id == repo.id)
+            .and_then(|op| self.entry_by_path(&op.anchor));
+        if bulk_restore_anchor_new_index == last_restore_path_prev_index
+            && bulk_restore_anchor_new_index.is_some()
+        {
+            self.bulk_restore = bulk_restore;
         }
 
         self.select_first_entry_if_none(window, cx);
@@ -5043,7 +5072,7 @@ impl GitPanel {
                                             return;
                                         }
                                         if click.modifiers().shift {
-                                            this.stage_bulk(ix, cx);
+                                            this.toggle_bulk(ix, cx);
                                         } else {
                                             let list_entry =
                                                 if GitPanelSettings::get_global(cx).tree_view {
@@ -5370,17 +5399,18 @@ impl GitPanel {
         })
     }
 
-    fn stage_bulk(&mut self, mut index: usize, cx: &mut Context<'_, Self>) {
-        let Some(op) = self.bulk_staging.as_ref() else {
+    fn toggle_bulk(&mut self, mut index: usize, cx: &mut Context<'_, Self>) {
+        let Some(op) = self.bulk_staging.clone() else {
             return;
         };
         let Some(mut anchor_index) = self.entry_by_path(&op.anchor) else {
             return;
         };
+        let stage = op.stage;
         if let Some(entry) = self.entries.get(index)
             && let Some(entry) = entry.status_entry()
         {
-            self.set_bulk_staging_anchor(entry.repo_path.clone(), cx);
+            self.set_bulk_staging_anchor(entry.repo_path.clone(), stage, cx);
         }
         if index < anchor_index {
             std::mem::swap(&mut index, &mut anchor_index);
@@ -5392,14 +5422,155 @@ impl GitPanel {
             .iter()
             .filter_map(|entry| entry.status_entry().cloned())
             .collect::<Vec<_>>();
-        self.change_file_stage(true, entries, cx);
+        self.change_file_stage(stage, entries, cx);
     }
 
-    fn set_bulk_staging_anchor(&mut self, path: RepoPath, cx: &mut Context<'_, GitPanel>) {
+    fn restore_bulk(&mut self, mut index: usize, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let Some(op) = self.bulk_restore.clone() else {
+            return;
+        };
+        let Some(mut anchor_index) = self.entry_by_path(&op.anchor) else {
+            return;
+        };
+        if let Some(entry) = self.entries.get(index)
+            && let Some(entry) = entry.status_entry()
+        {
+            self.set_bulk_restore_anchor(entry.repo_path.clone(), cx);
+        }
+        if index < anchor_index {
+            std::mem::swap(&mut index, &mut anchor_index);
+        }
+        let entries: Vec<_> = self
+            .entries
+            .get(anchor_index..=index)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|entry| entry.status_entry().cloned())
+            .collect();
+
+        match entries.len() {
+            0 => return,
+            1 => return self.revert_entry(&entries[0], window, cx),
+            _ => {}
+        }
+
+        let tracked_entries: Vec<_> = entries
+            .iter()
+            .filter(|e| !e.status.is_created())
+            .cloned()
+            .collect();
+        let created_entries: Vec<_> = entries
+            .iter()
+            .filter(|e| e.status.is_created())
+            .cloned()
+            .collect();
+
+        let mut details = entries
+            .iter()
+            .filter_map(|entry| entry.repo_path.as_ref().file_name())
+            .map(|filename| filename.to_string())
+            .take(5)
+            .join("\n");
+        if entries.len() > 5 {
+            details.push_str(&format!("\nand {} more…", entries.len() - 5))
+        }
+
+        let has_tracked = !tracked_entries.is_empty();
+        let has_created = !created_entries.is_empty();
+        let prompt_msg = match (has_tracked, has_created) {
+            (true, true) => "Discard changes and trash files?",
+            (true, false) => "Discard changes to these files?",
+            (false, true) => "Trash these files?",
+            (false, false) => return,
+        };
+
+        #[derive(strum::EnumIter, strum::VariantNames)]
+        #[strum(serialize_all = "title_case")]
+        enum RestoreRangeCancel {
+            Discard,
+            Cancel,
+        }
+
+        let workspace = self.workspace.clone();
+        let Some(active_repo) = self.active_repository.clone() else {
+            return;
+        };
+
+        let confirmation = prompt(prompt_msg, Some(&details), window, cx);
+        cx.spawn_in(window, async move |this, cx| {
+            match confirmation.await? {
+                RestoreRangeCancel::Discard => {}
+                RestoreRangeCancel::Cancel => return Ok(()),
+            }
+
+            if !tracked_entries.is_empty() {
+                let to_unstage: Vec<_> = tracked_entries
+                    .iter()
+                    .filter(|entry| entry.status.staging().has_staged())
+                    .cloned()
+                    .collect();
+                if !to_unstage.is_empty() {
+                    this.update(cx, |this, cx| {
+                        this.change_file_stage(false, to_unstage, cx);
+                    })?;
+                }
+
+                this.update_in(cx, |this, window, cx| {
+                    this.perform_checkout(tracked_entries, window, cx);
+                })?;
+            }
+
+            if !created_entries.is_empty() {
+                let tasks = workspace.update(cx, |workspace, cx| {
+                    created_entries
+                        .iter()
+                        .filter_map(|entry| {
+                            workspace.project().update(cx, |project, cx| {
+                                let project_path = active_repo
+                                    .read(cx)
+                                    .repo_path_to_project_path(&entry.repo_path, cx)?;
+                                project.delete_file(project_path, true, cx)
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                })?;
+                let to_unstage: Vec<_> = created_entries
+                    .into_iter()
+                    .filter(|entry| !entry.status.staging().is_fully_unstaged())
+                    .collect();
+                if !to_unstage.is_empty() {
+                    this.update(cx, |this, cx| {
+                        this.change_file_stage(false, to_unstage, cx);
+                    })?;
+                }
+                for task in tasks {
+                    task.await?;
+                }
+            }
+
+            Ok(())
+        })
+        .detach_and_prompt_err("Failed to restore files", window, cx, |e, _, _| {
+            Some(format!("{e}"))
+        });
+    }
+
+    fn set_bulk_staging_anchor(&mut self, path: RepoPath, stage: bool, cx: &mut Context<'_, GitPanel>) {
         let Some(repo) = self.active_repository.as_ref() else {
             return;
         };
         self.bulk_staging = Some(BulkStaging {
+            repo_id: repo.read(cx).id,
+            anchor: path,
+            stage,
+        });
+    }
+
+    fn set_bulk_restore_anchor(&mut self, path: RepoPath, cx: &mut Context<'_, GitPanel>) {
+        let Some(repo) = self.active_repository.as_ref() else {
+            return;
+        };
+        self.bulk_restore = Some(BulkRestore {
             repo_id: repo.read(cx).id,
             anchor: path,
         });
@@ -5439,6 +5610,8 @@ impl Render for GitPanel {
             .when(has_write_access && !project.is_read_only(cx), |this| {
                 this.on_action(cx.listener(Self::toggle_staged_for_selected))
                     .on_action(cx.listener(Self::stage_range))
+                    .on_action(cx.listener(Self::unstage_range))
+                    .on_action(cx.listener(Self::restore_range))
                     .on_action(cx.listener(GitPanel::on_commit))
                     .on_action(cx.listener(GitPanel::on_amend))
                     .on_action(cx.listener(GitPanel::toggle_signoff_enabled))
@@ -6446,13 +6619,17 @@ mod tests {
             ],
         );
 
+        // Test that unstaging a file sets the anchor with stage=false direction
+        // When we then call stage_range, it will unstage the range (not stage)
         let third_status_entry = entries[4].clone();
         panel.update_in(cx, |panel, window, cx| {
+            // This unstages entries[4] and sets anchor at entries[4] with stage=false
             panel.toggle_staged_for_entry(&third_status_entry, window, cx);
         });
 
         panel.update_in(cx, |panel, window, cx| {
             panel.selected_entry = Some(9);
+            // This will UNSTAGE entries 4-9 because anchor has stage=false
             panel.stage_range(&git::StageRange, window, cx);
         });
 
@@ -6478,6 +6655,8 @@ mod tests {
         handle.await;
 
         let entries = panel.read_with(cx, |panel, _| panel.entries.clone());
+        // After unstaging entries[4] and calling stage_range to 9, entries 4-9 are unstaged
+        // (because the anchor's direction is stage=false)
         #[rustfmt::skip]
         pretty_assertions::assert_matches!(
             entries.as_slice(),
@@ -6485,13 +6664,13 @@ mod tests {
                 Header(GitHeaderEntry { header: Section::Conflict }),
                 Status(GitStatusEntry { staging: StageStatus::Unstaged, .. }),
                 Header(GitHeaderEntry { header: Section::Tracked }),
-                Status(GitStatusEntry { staging: StageStatus::Staged, .. }),
-                Status(GitStatusEntry { staging: StageStatus::Unstaged, .. }),
-                Status(GitStatusEntry { staging: StageStatus::Staged, .. }),
+                Status(GitStatusEntry { staging: StageStatus::Staged, .. }),  // Index 3: was staged in first range, not in this range
+                Status(GitStatusEntry { staging: StageStatus::Unstaged, .. }), // Index 4: unstaged (toggled + anchor)
+                Status(GitStatusEntry { staging: StageStatus::Unstaged, .. }), // Index 5: unstaged by range
                 Header(GitHeaderEntry { header: Section::New }),
-                Status(GitStatusEntry { staging: StageStatus::Staged, .. }),
-                Status(GitStatusEntry { staging: StageStatus::Staged, .. }),
-                Status(GitStatusEntry { staging: StageStatus::Staged, .. }),
+                Status(GitStatusEntry { staging: StageStatus::Unstaged, .. }), // Index 7: unstaged by range
+                Status(GitStatusEntry { staging: StageStatus::Unstaged, .. }), // Index 8: already unstaged
+                Status(GitStatusEntry { staging: StageStatus::Unstaged, .. }), // Index 9: already unstaged
             ],
         );
     }
